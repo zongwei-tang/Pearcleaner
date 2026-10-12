@@ -273,11 +273,12 @@ struct TapRowView: View {
                     defer { isRemoving = false }
 
                     do {
-                        // Always use force flag - leaves packages installed
-                        try await HomebrewController.shared.removeTap(name: tap.name, force: true)
+                        // Never use force: since Homebrew 6.0.13 `untap --force` uninstalls every package from the tap.
+                        // Without it brew refuses to untap while packages from the tap are still installed.
+                        try await HomebrewController.shared.removeTap(name: tap.name, force: false)
                         // Just remove from list instead of reloading all taps
                         brewManager.removeTapFromList(name: tap.name)
-                        // Don't reload installed packages - they're still there
+                        // Don't reload installed packages - untap only succeeds when none came from this tap
                     } catch {
                         printOS("Error removing tap: \(error)")
                     }

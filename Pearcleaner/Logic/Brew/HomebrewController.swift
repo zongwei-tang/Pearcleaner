@@ -1040,7 +1040,7 @@ class HomebrewController: ObservableObject {
         var arguments = ["install"]
         if cask {
             arguments.append("--cask")
-            arguments.append("--no-quarantine")
+            // No --no-quarantine: deprecated in Homebrew 5.0, an error in 5.1, removed in 6.0
             if force {
                 arguments.append("--force")
             }
@@ -1082,7 +1082,7 @@ class HomebrewController: ObservableObject {
     func adoptCask(token: String) async throws {
         logger.log(.homebrew, "🔄 Adopting cask: \(token)")
 
-        let arguments = ["install", "--cask", "--adopt", "--no-quarantine", token]
+        let arguments = ["install", "--cask", "--adopt", token] // --no-quarantine was removed in Homebrew 6.0
 
         do {
             let result = try await runBrewCommand(arguments)
