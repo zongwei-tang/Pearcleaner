@@ -19,7 +19,30 @@ struct CodesignCheck {
     // MARK: - Compare Functions
 
     public static func codeSigningMatches(pid: pid_t) throws -> Bool {
-        return try self.codeSigningCertificatesForSelf() == self.codeSigningCertificates(forPID: pid)
+        let selfCertificates = try self.codeSigningCertificatesForSelf()
+        // Ad-hoc or unsigned helper: [] == [] would accept any ad-hoc process, so trust nobody
+        guard !selfCertificates.isEmpty else { return false }
+        return try selfCertificates == self.codeSigningCertificates(forPID: pid)
+    }
+
+    // MARK: - Client Requirement
+
+    /// Requirement every client must satisfy: the Pearcleaner app, signed by the same team as this helper.
+    /// The team is read from the helper's own signature, so a personal build pins its own team.
+    /// nil when the helper has no team identifier (ad-hoc build): then no client is accepted.
+    public static let clientRequirement: String? = {
+        guard let teamID = teamIdentifierForSelf() else { return nil }
+        return "anchor apple generic and identifier \"com.alienator88.Pearcleaner\" and certificate leaf[subject.OU] = \"\(teamID)\""
+    }()
+
+    /// Team identifier from the helper's own code signature, or nil when ad-hoc signed or unsigned
+    public static func teamIdentifierForSelf() -> String? {
+        guard let secStaticCode = try? secStaticCodeSelf(),
+              let info = try? secCodeInfo(forStaticCode: secStaticCode),
+              let teamID = info[kSecCodeInfoTeamIdentifier as String] as? String else { return nil }
+        // Only a well-formed team ID may go into a requirement string (a malformed requirement raises an exception)
+        guard teamID.count == 10, teamID.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber) }) else { return nil }
+        return teamID
     }
 
     // MARK: - Public Functions

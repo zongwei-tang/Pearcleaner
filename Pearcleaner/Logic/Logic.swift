@@ -245,12 +245,12 @@ func getSortedApps(paths: [String], useStreaming: Bool = false) -> [AppInfo] {
                                 let appPath = appURL.path
 
                                 // Use mini version for fast initial load
-                                if let appMetadata = metadataDictionary[appPath] {
-                                    return MetadataAppInfoFetcher.getAppInfoMini(fromMetadata: appMetadata, atPath: appURL)
-                                } else {
-                                    // Fallback to full version if no metadata
-                                    return AppInfoFetcher.getAppInfo(atPath: appURL)?.toMini()
+                                if let appMetadata = metadataDictionary[appPath],
+                                   let mini = MetadataAppInfoFetcher.getAppInfoMini(fromMetadata: appMetadata, atPath: appURL) {
+                                    return mini
                                 }
+                                // Fallback to full version if Spotlight metadata is missing or incomplete
+                                return AppInfoFetcher.getAppInfo(atPath: appURL)?.toMini()
                             }
                         }
 
@@ -1369,7 +1369,13 @@ func launchctl(load: Bool, completion: @escaping () -> Void = {}) {
     let service = SMAppService.agent(plistName: "com.alienator88.PearcleanerSentinel.plist")
 
     if load {
+        // macOS 27 launchd refuses quarantined plists, clear ours before registering
+        let strippedQuarantine = stripOwnLaunchdQuarantine()
         do {
+            // An already enabled agent keeps the plist launchd rejected, re-register so it is read again
+            if strippedQuarantine && service.status == .enabled {
+                try? service.unregister()
+            }
             try service.register()
         } catch let error as NSError {
             printOS("Error registering PearcleanerSentinel: \(error)")

@@ -73,6 +73,8 @@ struct TCCQueryResult {
     var systemPermissions: [TCCPermission] = []
     var userError: String?
     var systemError: String?
+    /// Set when the TCC databases cannot be read on this macOS version at all (macOS 27+)
+    var unavailableReason: String?
 
     var hasUserPermissions: Bool { !userPermissions.isEmpty }
     var hasSystemPermissions: Bool { !systemPermissions.isEmpty }

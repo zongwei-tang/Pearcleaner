@@ -111,6 +111,14 @@ class TCCQueryHelper {
 
         var result = TCCQueryResult()
 
+        // macOS 27 no longer lets apps read TCC.db directly, even with Full Disk Access (release note 90775556)
+        if #available(macOS 27, *) {
+            let reason = "Not available on macOS 27: apps can no longer read the privacy (TCC) database. Review this app in System Settings > Privacy & Security, or reset its permissions with: tccutil reset All \(bundleIdentifier)"
+            result.unavailableReason = reason
+            result.userError = reason
+            return result
+        }
+
         // User database path
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let userDBPath = "\(home)/Library/Application Support/com.apple.TCC/TCC.db"

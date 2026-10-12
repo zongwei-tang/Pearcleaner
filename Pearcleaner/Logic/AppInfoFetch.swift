@@ -131,7 +131,9 @@ class MetadataAppInfoFetcher {
         let fsName = metadata["kMDItemFSName"] as? String ?? path.lastPathComponent
         let appName = displayName.isEmpty ? fsName : displayName
 
-        let bundleIdentifier = metadata["kMDItemCFBundleIdentifier"] as? String ?? ""
+        // Spotlight can return a record without a bundle id, fall back to the bundle itself
+        let spotlightBundleIdentifier = (metadata["kMDItemCFBundleIdentifier"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let bundleIdentifier = spotlightBundleIdentifier ?? Bundle(url: path)?.bundleIdentifier ?? ""
 
         // Get version from bundle Info.plist
         let version: String = {

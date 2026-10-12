@@ -27,10 +27,17 @@ class HelperToolDelegate: NSObject, NSXPCListenerDelegate, HelperToolProtocol {
     
     // Accept new XPC connections by setting up the exported interface and object.
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        // Ad-hoc or unsigned helper: no team to pin clients to, so accept nobody
+        guard let clientRequirement = CodesignCheck.clientRequirement else {
+            print("❌ Rejected connection: helper has no team identifier")
+            return false
+        }
         guard isValidClient(connection: newConnection) else {
             print("❌ Rejected connection from unauthorized client")
             return false
         }
+        // Enforced by XPC on every message (audit token based), unlike the PID check above
+        newConnection.setCodeSigningRequirement(clientRequirement)
         newConnection.exportedInterface = NSXPCInterface(with: HelperToolProtocol.self)
         newConnection.exportedObject = self
         newConnection.invalidationHandler = { [weak self] in
@@ -52,14 +59,16 @@ class HelperToolDelegate: NSObject, NSXPCListenerDelegate, HelperToolProtocol {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        let data: Data
         do {
             try process.run()
+            // Drain the pipe before waiting, or a command printing more than the pipe buffer (~64 KB) deadlocks
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
         } catch {
             reply(false, "Failed to run command: \(error.localizedDescription)")
             return
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let success = (process.terminationStatus == 0) // Check if process exited successfully
         reply(success, output.isEmpty ? "No output" : output)

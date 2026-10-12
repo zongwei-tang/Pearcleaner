@@ -68,13 +68,13 @@ class PermissionManagerLocal: ObservableObject {
     }
 
     /// Attempt FDA check with retries and multiple fallback paths
-    /// First tries fast access() syscall, then falls back to directory listing
+    /// Actually lists a protected directory: access() only checks POSIX permissions, not TCC
     private func attemptFDACheck(maxAttempts: Int, delayMs: Int) -> Bool {
         // Multiple protected paths to check, in order of preference
         let checkPaths = [
-            "~/Library/Containers/com.apple.stocks",  // Primary - good for macOS 12+
-            "~/Library/Safari",                        // Fallback 1 - more universal
-            "~/Library/Mail"                           // Fallback 2 - additional option
+            "~/Library/Safari",                        // Primary - protected by Full Disk Access on every Mac
+            "~/Library/Mail",                          // Fallback 1 - additional option
+            "~/Library/Containers/com.apple.stocks"   // Fallback 2 - another team's container, can be granted on its own on macOS 27
         ]
 
         for attempt in 1...maxAttempts {
@@ -82,14 +82,7 @@ class PermissionManagerLocal: ObservableObject {
             for checkPath in checkPaths {
                 let expandedPath = NSString(string: checkPath).expandingTildeInPath
 
-                // Method 1: Try using access() syscall (fastest)
-                if let cPath = expandedPath.cString(using: .utf8) {
-                    if access(cPath, R_OK) == 0 {
-                        return true  // Success - have FDA
-                    }
-                }
-
-                // Method 2: Fallback to directory listing (more reliable but slower)
+                // Directory listing reads data, so it fails when TCC denies access
                 let fileManager = FileManager.default
                 if let _ = try? fileManager.contentsOfDirectory(atPath: expandedPath) {
                     return true
