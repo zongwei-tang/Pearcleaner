@@ -222,13 +222,22 @@ struct FileListView: View {
                     }
 
                     if appState.trashError {
+                        let needsFullDiskAccess = FileManagerUndo.shared.lastErrorNeedsFullDiskAccess
                         HStack {
                             Spacer()
                             InfoButton(
-                                text:
-                                    "A trash error has occurred, please open the debug window(⌘+D) to see what went wrong or try again",
+                                text: needsFullDiskAccess
+                                    ? "macOS blocked access to some files (Operation not permitted), so they were not moved to the Trash. Grant Pearcleaner Full Disk Access in System Settings > Privacy & Security, then try again. Files protected by System Integrity Protection cannot be removed this way."
+                                    : "A trash error has occurred, please open the debug window(⌘+D) to see what went wrong or try again",
                                 color: .orange, label: "View Error", warning: true,
                                 extraView: {
+                                    if needsFullDiskAccess {
+                                        Button("Open Full Disk Access Settings") {
+                                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                                                NSWorkspace.shared.open(url)
+                                            }
+                                        }
+                                    }
                                     Button("View Debug Window") {
                                         windowController.open(
                                             with: ConsoleView(), width: 600, height: 400)

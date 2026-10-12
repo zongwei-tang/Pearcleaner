@@ -19,6 +19,9 @@ class FileManagerUndo {
     // NSUndoManager instance to handle undo/redo actions
     let undoManager = UndoManager()
 
+    /// Set on the main thread together with AppState.trashError: true when macOS refused access to some items
+    private(set) var lastErrorNeedsFullDiskAccess = false
+
     // MARK: - Path Validation
     /// Validates that a path is safe to delete (not a critical system path or app folder)
     private func validatePath(_ path: String) -> Bool {
@@ -80,7 +83,8 @@ class FileManagerUndo {
         var tempFilePairs: [(trashURL: URL, originalURL: URL)] = []
         var seenFileNames: [String: Int] = [:]
 
-        let hasProtectedFiles = validURLs.contains { $0.isProtected }
+        // Moving an item also needs write access to the folder it is in
+        let hasProtectedFiles = validURLs.contains { $0.isProtected || $0.deletingLastPathComponent().isProtected }
 
         // Create bundle folder name with app name and timestamp
         let dateFormatter = DateFormatter()
@@ -106,7 +110,7 @@ class FileManagerUndo {
         let bundleFolderURL = URL(fileURLWithPath: bundleFolderPath)
 
         // Create the bundle folder first
-        let createFolderCommand = "/bin/mkdir -p \"\(bundleFolderPath)\""
+        let createFolderCommand = "/bin/mkdir -p \(bundleFolderPath.shellQuoted)"
 
         let mvCommands = validURLs.map { file -> String in
             let baseName = file.lastPathComponent
@@ -126,18 +130,22 @@ class FileManagerUndo {
             let destinationURL = bundleFolderURL.appendingPathComponent(finalName)
             tempFilePairs.append((trashURL: destinationURL, originalURL: file))
 
-            let source = "\"\(file.path)\""
-            let destination = "\"\(destinationURL.path)\""
-            return "/bin/mv \(source) \(destination)"
-        }.joined(separator: " ; ")
+            return "/bin/mv \(file.path.shellQuoted) \(destinationURL.path.shellQuoted)"
+        }
 
-        // Combine folder creation and file moves
-        let finalCommands = "\(createFolderCommand) ; \(mvCommands)"
         let filePairs = tempFilePairs
 
-        if executeFileCommands(finalCommands, isCLI: isCLI, hasProtectedFiles: hasProtectedFiles) {
+        // Create the bundle folder as the user, so moves retried without privileges can still land in it
+        try? FileManager.default.createDirectory(atPath: bundleFolderPath, withIntermediateDirectories: true)
+
+        let outcome = executeFileCommands(mvCommands, before: createFolderCommand, isCLI: isCLI, hasProtectedFiles: hasProtectedFiles)
+
+        // Only the moves that really happened can be undone
+        let movedPairs = filePairs.indices.filter { !outcome.failed.contains($0) }.map { filePairs[$0] }
+
+        if !movedPairs.isEmpty {
             undoManager.registerUndo(withTarget: self) { target in
-                let result = target.restoreFiles(filePairs: filePairs)
+                let result = target.restoreFiles(filePairs: movedPairs)
                 if !result {
                     printOS("Trash Error: Could not restore files.")
                 }
@@ -149,7 +157,7 @@ class FileManagerUndo {
                 UndoHistoryManager.shared.addRecord(
                     appName: folderName,
                     bundleFolderPath: bundleFolderPath,
-                    filePairs: filePairs.map { ($0.originalURL.path, $0.trashURL.path) }
+                    filePairs: movedPairs.map { ($0.originalURL.path, $0.trashURL.path) }
                 )
             }
 
@@ -157,13 +165,32 @@ class FileManagerUndo {
             if !isCLI {
                 playTrashSound()
             }
+        } else {
+            // Nothing was moved: do not leave an empty bundle folder in the Trash (rmdir only removes empty folders)
+            rmdir(bundleFolderPath)
+        }
 
+        // A source that no longer exists (e.g. removed by the app itself while quitting) is gone, not a failure; it has nothing to undo.
+        // attributesOfItem does not follow symlinks, and a TCC denial reports no permission, so those stay failures
+        let vanishedIndexes: Set<Int> = outcome.cancelled ? [] : outcome.failed.filter { index in
+            do {
+                _ = try FileManager.default.attributesOfItem(atPath: filePairs[index].originalURL.path)
+                return false
+            } catch let error as CocoaError {
+                return error.code == .fileReadNoSuchFile
+            } catch {
+                return false
+            }
+        }
+        for index in vanishedIndexes.sorted() {
+            printOS("Trash: already gone, skipped: \(filePairs[index].originalURL.path)")
+        }
+        let failedIndexes = outcome.failed.subtracting(vanishedIndexes)
+
+        if failedIndexes.isEmpty {
             finalStatus = true
         } else {
-            //            printOS("Trash Error: \(isCLI ? "Could not run commands directly with sudo." : "Could not perform privileged commands.")")
-            updateOnMain {
-                AppState.shared.trashError = true
-            }
+            reportFailure(outcome, notMoved: failedIndexes.sorted().map { filePairs[$0].originalURL.path }, isRestore: false)
             finalStatus = false
         }
 
@@ -178,14 +205,12 @@ class FileManagerUndo {
         var finalStatus = true
 
         let hasProtectedFiles = filePairs.contains {
-            $0.originalURL.deletingLastPathComponent().isProtected
+            $0.originalURL.deletingLastPathComponent().isProtected || $0.trashURL.isProtected
         }
 
         let commands = filePairs.map {
-            let source = "\"\($0.trashURL.path)\""
-            let destination = "\"\($0.originalURL.path)\""
-            return "/bin/mv \(source) \(destination)"
-        }.joined(separator: " ; ")
+            "/bin/mv \($0.trashURL.path.shellQuoted) \($0.originalURL.path.shellQuoted)"
+        }
 
         // Determine the bundle folder to clean up after restore
         var bundleFolderToRemove: String? = nil
@@ -197,14 +222,12 @@ class FileManagerUndo {
             }
         }
 
-        // Add bundle folder cleanup command if we have one to remove
-        let finalCommands = if let bundleFolder = bundleFolderToRemove {
-            "\(commands) ; /bin/rmdir \"\(bundleFolder)\""
-        } else {
-            commands
-        }
+        // Add bundle folder cleanup command if we have one to remove (it only succeeds once the folder is empty)
+        let cleanupCommand = bundleFolderToRemove.map { "/bin/rmdir \($0.shellQuoted)" }
 
-        if executeFileCommands(finalCommands, isCLI: isCLI, hasProtectedFiles: hasProtectedFiles, isRestore: true) {
+        let outcome = executeFileCommands(commands, after: cleanupCommand, isCLI: isCLI, hasProtectedFiles: hasProtectedFiles, isRestore: true)
+
+        if outcome.failed.isEmpty {
             // Remove from persistent history after successful restore
             if let bundleFolder = bundleFolderToRemove {
                 Task { @MainActor in
@@ -214,10 +237,14 @@ class FileManagerUndo {
 
             finalStatus = true
         } else {
-            //            printOS("Trash Error: \(isCLI ? "Failed to run restore CLI commands" : "Failed to run restore privileged commands")")
-            updateOnMain {
-                AppState.shared.trashError = true
+            // Keep the items that were not restored in history, so they can still be restored later
+            if let bundleFolder = bundleFolderToRemove, outcome.failed.count < filePairs.count {
+                let remainingPairs = outcome.failed.sorted().map { (filePairs[$0].originalURL.path, filePairs[$0].trashURL.path) }
+                Task { @MainActor in
+                    UndoHistoryManager.shared.updateRecord(bundleFolderPath: bundleFolder, filePairs: remainingPairs)
+                }
             }
+            reportFailure(outcome, notMoved: outcome.failed.sorted().map { filePairs[$0].trashURL.path }, isRestore: true)
             finalStatus = false
         }
 
@@ -226,44 +253,145 @@ class FileManagerUndo {
         return finalStatus
     }
 
-    // Helper function to perform shell commands based on available privileges
-    private func executeFileCommands(_ commands: String, isCLI: Bool, hasProtectedFiles: Bool, isRestore: Bool = false) -> Bool {
-        let semaphore = DispatchSemaphore(value: 0)
-        var status = false
+    /// Outcome of a batch of moves: the indexes of the moves that did not happen, and whether the user cancelled the password prompt
+    private struct FileCommandsResult {
+        var failed: Set<Int> = []
+        var cancelled = false
+        var output = ""
+    }
 
-        // Try privileged wrapper (helper tool or Authorization Services)
+    // Helper function to perform shell commands based on available privileges
+    // Each move reports its own failure in the output, since a " ; " chain only returns the status of its last command.
+    // Every chain exits 0 once it ran, so runSUCommand never re-runs half-done moves through the password prompt.
+    private func executeFileCommands(_ moves: [String], before: String? = nil, after: String? = nil, isCLI: Bool, hasProtectedFiles: Bool, isRestore: Bool = false) -> FileCommandsResult {
+        guard !moves.isEmpty else { return FileCommandsResult() }
+
+        let token = UUID().uuidString
+        let failMarker = "PCFAIL-\(token):"
+        let doneMarker = "PCDONE-\(token)"
+        func script(for indexes: [Int]) -> String {
+            var parts = before.map { ["\($0) 2>&1"] } ?? []
+            parts += indexes.map { "\(moves[$0]) 2>&1 || echo \(failMarker)\($0)" }
+            if let after = after {
+                parts.append("\(after) 2>/dev/null || true")
+            }
+            parts.append("echo \(doneMarker)")
+            return parts.joined(separator: " ; ")
+        }
+        func failures(in output: String, for indexes: [Int]) -> Set<Int> {
+            let lines = output.split(whereSeparator: \.isNewline)
+            // Without the completion marker the script did not run to the end, so none of its moves count as done
+            guard lines.contains(where: { $0 == doneMarker }) else { return Set(indexes) }
+            return Set(lines.compactMap { line in
+                line.hasPrefix(failMarker) ? Int(line.dropFirst(failMarker.count)) : nil
+            })
+        }
+
+        var result = FileCommandsResult()
+        let allIndexes = Array(moves.indices)
+
+        if hasProtectedFiles {
+            // Authorize before touching anything, so a cancelled password prompt leaves every file in place
+            let privileged = runPrivilegedCommand(script(for: allIndexes), isRestore: isRestore)
+            result.output = privileged.output
+
+            if isAuthorizationRefused(privileged.output) {
+                result.failed = Set(allIndexes)
+                result.cancelled = true
+                return result
+            }
+
+            guard privileged.success else {
+                // Never fall back after a cancel. The CLI may have no GUI session for the prompt, but works directly when run as root
+                if isCLI {
+                    let direct = runDirectShellCommand(command: script(for: allIndexes))
+                    result.output += "\n" + direct.1
+                    result.failed = failures(in: direct.1, for: allIndexes)
+                } else {
+                    result.failed = Set(allIndexes)
+                }
+                return result
+            }
+
+            result.failed = failures(in: privileged.output, for: allIndexes)
+
+            // macOS can deny the helper access to other apps' data while this app is allowed (Full Disk Access): retry those here
+            if !result.failed.isEmpty && isPermissionError(privileged.output) {
+                let retryIndexes = result.failed.sorted()
+                let direct = runDirectShellCommand(command: script(for: retryIndexes))
+                result.output += "\n" + direct.1
+                result.failed.formIntersection(failures(in: direct.1, for: retryIndexes))
+            }
+        } else {
+            // Everything is writable by the user: move without privileges, and escalate only the moves refused for lack of permission
+            let direct = runDirectShellCommand(command: script(for: allIndexes))
+            result.output = direct.1
+            result.failed = failures(in: direct.1, for: allIndexes)
+
+            if !result.failed.isEmpty && isPermissionError(direct.1) {
+                let retryIndexes = result.failed.sorted()
+                let privileged = runPrivilegedCommand(script(for: retryIndexes), isRestore: isRestore)
+                result.output += "\n" + privileged.output
+                if privileged.success {
+                    result.failed.formIntersection(failures(in: privileged.output, for: retryIndexes))
+                } else {
+                    result.cancelled = isAuthorizationRefused(privileged.output)
+                }
+            }
+        }
+
+        return result
+    }
+
+    // Runs commands through the helper tool or Authorization Services (password prompt) and waits for the result
+    private func runPrivilegedCommand(_ command: String, isRestore: Bool) -> (success: Bool, output: String) {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: (success: Bool, output: String) = (false, "")
+
         Task {
-            let result = try! await runSUCommand(
-                commands,
+            result = try! await runSUCommand(
+                command,
                 errorContext: isRestore ? "Undo restore operation failed" : "Undo delete operation failed",
                 throwOnFailure: false
             )
-            status = result.0
-
-            if !status {
-                printOS(isRestore ? "Restore Error: \(result.1)" : "Trash Error: \(result.1)")
-                updateOnMain {
-                    AppState.shared.trashError = true
-                }
-
-                // Fallback to direct shell if appropriate
-                if isCLI || !hasProtectedFiles {
-                    let shellResult = runDirectShellCommand(command: commands)
-                    status = shellResult.0
-                    if !status {
-                        printOS(isRestore ? "Restore Error: \(shellResult.1)" : "Trash Error: \(shellResult.1)")
-                        updateOnMain {
-                            AppState.shared.trashError = true
-                        }
-                    }
-                }
-            }
-
             semaphore.signal()
         }
         semaphore.wait()
 
-        return status
+        return result
+    }
+
+    // Logs the items that were not moved and raises the trash error banner, unless the user cancelled the password prompt
+    private func reportFailure(_ result: FileCommandsResult, notMoved paths: [String], isRestore: Bool) {
+        let label = isRestore ? "Restore Error" : "Trash Error"
+        if result.cancelled {
+            printOS(isRestore ? "Restore cancelled at the authorization prompt" : "Deletion cancelled at the authorization prompt")
+        } else {
+            printOS("\(label): \(result.output)")
+        }
+        for path in paths {
+            printOS("\(label): not moved: \(path)")
+        }
+        guard !result.cancelled else { return }
+
+        // macOS 27 denies access to other apps' data containers without asking; Full Disk Access allows it
+        var needsFullDiskAccess = false
+        if #available(macOS 27, *) {
+            needsFullDiskAccess = result.output.lowercased().contains("operation not permitted")
+        }
+        if needsFullDiskAccess {
+            printOS("\(label): macOS blocked access to some items. Grant Pearcleaner Full Disk Access in System Settings > Privacy & Security > Full Disk Access, then try again.")
+        }
+
+        updateOnMain {
+            self.lastErrorNeedsFullDiskAccess = needsFullDiskAccess
+            AppState.shared.trashError = true
+        }
+    }
+
+    private func isPermissionError(_ output: String) -> Bool {
+        let lowercased = output.lowercased()
+        return lowercased.contains("permission denied") || lowercased.contains("operation not permitted")
     }
 
     // Helper to run direct non-privileged shell commands
@@ -277,12 +405,14 @@ class FileManagerUndo {
         task.standardError = pipe
 
         task.launch()
+
+        // Read before waiting: a full pipe would otherwise block the shell and this wait forever
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
 
-        if output.lowercased().contains("permission denied") {
+        if isPermissionError(output) {
             return (false, output)
         }
 

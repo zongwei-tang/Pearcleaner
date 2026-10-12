@@ -228,24 +228,35 @@ struct FilesView: View {
                     await killApp(appId: appState.appInfo.bundleIdentifier)
 
                     // Trash the files
-                    let _ = moveFilesToTrash(appState: appState, at: selectedItemsArray)
+                    let trashed = moveFilesToTrash(appState: appState, at: selectedItemsArray)
+
+                    guard trashed else {
+                        // Cancelled at the password prompt or not everything could be moved: keep the app, its file list
+                        // and the selection as they are, and do not go on to the Homebrew cleanup
+                        GlobalConsoleManager.shared.appendOutput("✗ Deletion for \(appState.appInfo.appName) was cancelled or did not complete, see the debug window (⌘D) for details\n", source: CurrentPage.applications.title)
+                        sendStartNotificationFW()
+                        return
+                    }
+
+                    // Only count what is really gone from disk (a locked item that could not be unlocked is skipped)
+                    let removedItems = selectedItemsArray.filter { !FileManager.default.fileExists(atPath: $0.path) }
 
                     // Always cleanup UI, regardless of whether files physically existed
                     updateOnMain {
-                        // Remove selected items from app's file list
+                        // Remove deleted items from app's file list
                         appState.appInfo.fileSize = appState.appInfo.fileSize.filter {
-                            !selectedItemsArray.contains($0.key)
+                            !removedItems.contains($0.key)
                         }
                         appState.appInfo.fileIcon = appState.appInfo.fileIcon.filter {
-                            !selectedItemsArray.contains($0.key)
+                            !removedItems.contains($0.key)
                         }
-                        appState.selectedItems.removeAll()
+                        appState.selectedItems.subtract(removedItems)
                         updateSortedFiles()
                     }
 
                     // Determine if it's a full delete
                     let appPath = appState.appInfo.path.absoluteString
-                    let appRemoved = selectedItemsArray.contains(where: {
+                    let appRemoved = removedItems.contains(where: {
                         $0.absoluteString == appPath
                     })
 
@@ -258,7 +269,7 @@ struct FilesView: View {
                                 .deletingLastPathComponent()  // Remove ActualApp.app -> Container.app/Wrapper
                                 .deletingLastPathComponent()  // Remove Wrapper -> Container.app
 
-                            return selectedItemsArray.contains(where: {
+                            return removedItems.contains(where: {
                                 $0.absoluteString == containerPath.absoluteString
                             })
                         }

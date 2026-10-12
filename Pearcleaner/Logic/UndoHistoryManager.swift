@@ -144,6 +144,21 @@ class UndoHistoryManager: ObservableObject {
         }
     }
 
+    /// Keep only the given file pairs in a record (called when a restore only partly succeeded)
+    func updateRecord(bundleFolderPath: String, filePairs: [(String, String)]) {
+        guard let index = history.firstIndex(where: { $0.bundleFolderPath == bundleFolderPath }) else { return }
+        let record = history[index]
+        history[index] = UndoHistoryRecord(
+            id: record.id,
+            timestamp: record.timestamp,
+            appName: record.appName,
+            bundleFolderPath: record.bundleFolderPath,
+            filePairs: filePairs,
+            fileCount: filePairs.count
+        )
+        saveHistory()
+    }
+
     /// Remove stale entries where bundle folder no longer exists in trash
     func cleanupStaleEntries() {
         let initialCount = history.count

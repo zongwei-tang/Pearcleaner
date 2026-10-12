@@ -89,7 +89,7 @@ func manageSymlink(install: Bool, symlinkName: String = "pear") {
         if !binPathExists {
             command += "mkdir -p /usr/local/bin && "
         }
-        command += "ln -s '\(appPath)' '\(symlinkPath)'"
+        command += "ln -s \(appPath.shellQuoted) \(symlinkPath.shellQuoted)"
     } else {
         // Remove the symlink using FileManagerUndo for safe trash deletion
         let _ = FileManagerUndo.shared.deleteFiles(at: [URL(fileURLWithPath: symlinkPath)], bundleName: "CLI-Symlink")
@@ -786,8 +786,19 @@ func getSystemDebugString() -> String {
     }
     let memoryUsage = result == KERN_SUCCESS ? formatBytes(Int64(taskInfo.resident_size)) : "unknown"
 
-    // Full Disk Access status
-    let hasFullDiskAccess = FileManager.default.isReadableFile(atPath: "/Library/Application Support/com.apple.TCC/TCC.db")
+    // Full Disk Access status: macOS 27 no longer lets apps read TCC.db, so try to list a folder that Full Disk Access protects
+    let hasFullDiskAccess: Bool = {
+        guard let libraryURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first else { return false }
+        do {
+            _ = try FileManager.default.contentsOfDirectory(atPath: libraryURL.appendingPathComponent("Safari").path)
+            return true
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            // No Safari data to probe: use the result of the startup permission check
+            return PermissionManagerLocal.shared.results?.fullDiskAccess ?? false
+        } catch {
+            return false
+        }
+    }()
 
     return """
 
@@ -879,4 +890,20 @@ func runSUCommand(
     }
 
     return (success, output)
+}
+
+/// True when runSUCommand failed because the user cancelled the password prompt (or it was denied), so nothing ran.
+/// AlinFoundation's performPrivilegedCommands only reports this as text: "Authorization copy rights failed with code <OSStatus>".
+/// Other failures (e.g. errAuthorizationInteractionNotAllowed without a GUI session) are not a refusal.
+func isAuthorizationRefused(_ output: String) -> Bool {
+    let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard text.hasPrefix("Authorization copy rights failed with code") else { return false }
+    return text.hasSuffix(" \(errAuthorizationCanceled)") || text.hasSuffix(" \(errAuthorizationDenied)")
+}
+
+extension String {
+    /// POSIX single-quoted form of the string, safe to interpolate as one argument into a /bin/sh command
+    var shellQuoted: String {
+        "'" + replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
 }
