@@ -1,0 +1,11 @@
+//
+//  Signing.local.xcconfig.example
+//  Pearcleaner
+//
+//  Copy to Config/Signing.local.xcconfig (git-ignored) and set your own 10-character Team ID.
+//  Find it in Xcode > Settings > Accounts (select the team), or in the "OU" field of your
+//  "Apple Development" certificate in Keychain Access.
+//  Required: it selects the signing certificate and prefixes the App Group (TEAMID.com.alienator88.Pearcleaner).
+//
+
+DEVELOPMENT_TEAM = ABCDE12345

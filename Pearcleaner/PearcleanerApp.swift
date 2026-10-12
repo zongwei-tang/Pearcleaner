@@ -19,7 +19,16 @@ struct PearcleanerApp: App {
     //MARK: StateObjects
     @StateObject var locations = Locations()
     @StateObject var fsm = FolderSettingsManager.shared
-    @StateObject private var updater = Updater(owner: "alienator88", repo: "Pearcleaner")
+    @StateObject private var updater = PearcleanerApp.makeDisabledUpdater()
+
+    // Personal build: self-updater disabled so it can never replace this build with an upstream release (see BUILD-LOCAL.md).
+    // Empty owner/repo can never name a GitHub repo, so no release is ever fetched and download/install stays inert even
+    // for forced checks; frequency is forced to Never so nothing is checked at launch; announcements are off.
+    // To restore upstream behavior: @StateObject private var updater = Updater(owner: "alienator88", repo: "Pearcleaner")
+    private static func makeDisabledUpdater() -> Updater {
+        UserDefaults.standard.set(UpdateFrequency.none.rawValue, forKey: "alinfoundation.updater.updateFrequency")
+        return Updater(owner: "", repo: "", announcements: false)
+    }
 
     init() {
         //MARK: GUI or CLI launch mode.

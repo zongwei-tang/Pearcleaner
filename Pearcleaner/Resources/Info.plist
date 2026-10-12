@@ -32,6 +32,8 @@
 			</array>
 		</dict>
 	</array>
+	<key>PearcleanerAppGroup</key>
+	<string>$(DEVELOPMENT_TEAM).com.alienator88.Pearcleaner</string>
 	<key>NSServices</key>
 	<array>
 		<dict>

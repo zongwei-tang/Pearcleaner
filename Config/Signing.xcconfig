@@ -1,0 +1,19 @@
+//
+//  Signing.xcconfig
+//  Pearcleaner
+//
+//  Project-level signing settings for a personal build (see BUILD-LOCAL.md).
+//  Targets do not override these keys, so this file is the only place signing is configured.
+//  Put your Team ID in Config/Signing.local.xcconfig (git-ignored), not here.
+//
+//  Manual + Apple Development + no provisioning profile: the bundle IDs stay com.alienator88.*,
+//  which are registered to the upstream team, so Automatic signing cannot register them for yours.
+//  Never sign with "-" (ad-hoc / Sign to Run Locally): the privileged helper would then trust any ad-hoc process.
+//
+
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = Apple Development
+DEVELOPMENT_TEAM =
+PROVISIONING_PROFILE_SPECIFIER =
+
+#include? "Signing.local.xcconfig"

@@ -92,3 +92,5 @@ iOSInjectionProject/
 Builds/Export
 .claude
 Pearcleaner/Resources/Localizable.xcstrings.bak
+# Personal signing (see BUILD-LOCAL.md)
+Config/Signing.local.xcconfig
