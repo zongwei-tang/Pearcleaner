@@ -12,24 +12,30 @@ struct Condition: Codable {
     var include: [String]
     var exclude: [String]
     var includeForce: [URL]?
+    // excludeForce removes the path and everything below it; includeForce paths are added after that
     var excludeForce: [URL]?
+    // Lowercased dotted bundle ID. A rule applies only to that exact app unless matchPrefix makes it family-wide
+    var rawBundleId: String
+    var matchPrefix: Bool
+    // Orphan scan only: tokens that keep shared folders out of the orphan list while an app of this rule is installed
+    var reverseProtect: [String]
 
-    init(bundle_id: String, include: [String], exclude: [String], includeForce: [String]? = nil, excludeForce: [String]? = nil) {
+    init(bundle_id: String, include: [String], exclude: [String], includeForce: [String]? = nil, excludeForce: [String]? = nil, matchPrefix: Bool = false, reverseProtect: [String] = []) {
         self.bundle_id = bundle_id.pearFormat()
+        self.rawBundleId = bundle_id.lowercased()
+        self.matchPrefix = matchPrefix
         self.include = include.map { $0.pearFormat() }
         self.exclude = exclude.map { $0.pearFormat() }
-        self.includeForce = includeForce?.compactMap { path in
-            if let url = URL(string: path), FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-            return nil
-        }
-        self.excludeForce = excludeForce?.compactMap { path in
-            if let url = URL(string: path), FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-            return nil
-        }
+        self.reverseProtect = reverseProtect.map { $0.pearFormat() }
+        // fileURLWithPath keeps paths with spaces on macOS 13, where URL(string:) returns nil; existence is checked when the paths are used
+        self.includeForce = includeForce?.map { URL(fileURLWithPath: $0) }
+        self.excludeForce = excludeForce?.map { URL(fileURLWithPath: $0) }
+    }
+
+    // Exact, case-insensitive bundle ID match, so com.google.Chrome's rule no longer applies to com.google.Chrome.beta
+    func applies(to bundleIdentifier: String) -> Bool {
+        let id = bundleIdentifier.lowercased()
+        return matchPrefix ? id.hasPrefix(rawBundleId) : id == rawBundleId
     }
 }
 
@@ -73,11 +79,30 @@ var conditions: [Condition] = [
         exclude: [],
         includeForce: nil
     ),
+    // Brave channels keep their profiles side by side under BraveSoftware; each channel selects only its own folder
     Condition(
-        bundle_id: "com.brave.browser",
-        include: ["brave"],
+        bundle_id: "com.brave.Browser",
+        include: ["bravebrowser"],
+        exclude: ["browserbeta", "browsernightly"],
+        includeForce: ["\(home)/Library/Application Support/BraveSoftware/Brave-Browser/", "\(home)/Library/Caches/BraveSoftware/Brave-Browser/"],
+        excludeForce: ["\(home)/Library/Application Support/BraveSoftware/", "\(home)/Library/Caches/BraveSoftware/"],
+        reverseProtect: ["brave"]
+    ),
+    Condition(
+        bundle_id: "com.brave.Browser.beta",
+        include: ["bravebrowserbeta"],
         exclude: [],
-        includeForce: nil
+        includeForce: ["\(home)/Library/Application Support/BraveSoftware/Brave-Browser-Beta/", "\(home)/Library/Caches/BraveSoftware/Brave-Browser-Beta/"],
+        excludeForce: ["\(home)/Library/Application Support/BraveSoftware/", "\(home)/Library/Caches/BraveSoftware/"],
+        reverseProtect: ["brave"]
+    ),
+    Condition(
+        bundle_id: "com.brave.Browser.nightly",
+        include: ["bravebrowsernightly"],
+        exclude: [],
+        includeForce: ["\(home)/Library/Application Support/BraveSoftware/Brave-Browser-Nightly/", "\(home)/Library/Caches/BraveSoftware/Brave-Browser-Nightly/"],
+        excludeForce: ["\(home)/Library/Application Support/BraveSoftware/", "\(home)/Library/Caches/BraveSoftware/"],
+        reverseProtect: ["brave"]
     ),
     Condition(
         bundle_id: "com.okta.mobile",
@@ -85,14 +110,69 @@ var conditions: [Condition] = [
         exclude: [],
         includeForce: nil
     ),
+    // Chrome channels keep their profiles side by side under Google, next to other Google products and the shared updater;
+    // each channel selects only its own folder (#607)
     Condition(
-        bundle_id: "com.google.chrome",
-        include: ["google", "chrome"],
-        exclude: ["iterm", "chromefeaturestate", "monochrome"],
+        bundle_id: "com.google.Chrome",
+        include: ["googlechrome"],
+        exclude: ["iterm", "chromefeaturestate", "monochrome", "chromebeta", "chromedev", "chromecanary", "chromefortesting"],
+        includeForce: ["\(home)/Library/Application Support/Google/Chrome/", "\(home)/Library/Caches/Google/Chrome/"],
+        excludeForce: ["\(home)/Library/Application Support/Google/", "\(home)/Library/Caches/Google/"],
+        reverseProtect: ["google", "chrome"]
+    ),
+    Condition(
+        bundle_id: "com.google.Chrome.beta",
+        include: ["googlechromebeta"],
+        exclude: [],
+        includeForce: ["\(home)/Library/Application Support/Google/Chrome Beta/", "\(home)/Library/Caches/Google/Chrome Beta/"],
+        excludeForce: ["\(home)/Library/Application Support/Google/", "\(home)/Library/Caches/Google/"],
+        reverseProtect: ["google", "chrome"]
+    ),
+    Condition(
+        bundle_id: "com.google.Chrome.dev",
+        include: ["googlechromedev"],
+        exclude: [],
+        includeForce: ["\(home)/Library/Application Support/Google/Chrome Dev/", "\(home)/Library/Caches/Google/Chrome Dev/"],
+        excludeForce: ["\(home)/Library/Application Support/Google/", "\(home)/Library/Caches/Google/"],
+        reverseProtect: ["google", "chrome"]
+    ),
+    Condition(
+        bundle_id: "com.google.Chrome.canary",
+        include: ["googlechromecanary"],
+        exclude: [],
+        includeForce: ["\(home)/Library/Application Support/Google/Chrome Canary/", "\(home)/Library/Caches/Google/Chrome Canary/"],
+        excludeForce: ["\(home)/Library/Application Support/Google/", "\(home)/Library/Caches/Google/"],
+        reverseProtect: ["google", "chrome"]
+    ),
+    Condition(
+        bundle_id: "com.google.chrome.for.testing",
+        include: ["googlechromefortesting"],
+        exclude: [],
+        includeForce: ["\(home)/Library/Application Support/Google/Chrome for Testing/", "\(home)/Library/Caches/Google/Chrome for Testing/"],
+        excludeForce: ["\(home)/Library/Application Support/Google/", "\(home)/Library/Caches/Google/"],
+        reverseProtect: ["google", "chrome"]
+    ),
+    // Edge channels: stable must not pick up the Beta/Dev/Canary items that contain its bundle ID
+    Condition(
+        bundle_id: "com.microsoft.edgemac",
+        include: [],
+        exclude: ["vscode", "rdc", "appcenter", "office", "oneauth", "edgebeta", "edgedev", "edgecanary", "edgemacbeta", "edgemacdev", "edgemaccanary"],
         includeForce: nil
     ),
     Condition(
-        bundle_id: "com.microsoft.edgemac",
+        bundle_id: "com.microsoft.edgemac.Beta",
+        include: [],
+        exclude: ["vscode", "rdc", "appcenter", "office", "oneauth"],
+        includeForce: nil
+    ),
+    Condition(
+        bundle_id: "com.microsoft.edgemac.Dev",
+        include: [],
+        exclude: ["vscode", "rdc", "appcenter", "office", "oneauth"],
+        includeForce: nil
+    ),
+    Condition(
+        bundle_id: "com.microsoft.edgemac.Canary",
         include: [],
         exclude: ["vscode", "rdc", "appcenter", "office", "oneauth"],
         includeForce: nil
@@ -103,11 +183,14 @@ var conditions: [Condition] = [
         exclude: ["office"],
         includeForce: nil
     ),
+    // Firefox channels share the profile folders Application Support/Firefox and Caches/Firefox, and the Mozilla folder
+    // holds other apps' native messaging hosts; only the default channel may select the shared profile folders (#506)
     Condition(
         bundle_id: "org.mozilla.firefox",
         include: ["firefox"],
-        exclude: ["thunderbird"],
-        includeForce: nil
+        exclude: ["thunderbird", "firefoxdeveloperedition", "firefoxnightly", "orgmozillanightly"],
+        includeForce: nil,
+        excludeForce: ["\(home)/Library/Application Support/Mozilla/"]
     ),
     Condition(
         bundle_id: "org.mozilla.thunderbird",
@@ -116,14 +199,32 @@ var conditions: [Condition] = [
         includeForce: nil
     ),
     Condition(
-        bundle_id: "org.mozilla.firefox.nightly",
-        include: ["mozilla", "firefox"],
+        bundle_id: "org.mozilla.firefoxdeveloperedition",
+        include: ["firefoxdeveloperedition"],
         exclude: ["thunderbird"],
-        includeForce: nil
+        includeForce: nil,
+        excludeForce: ["\(home)/Library/Application Support/Firefox/", "\(home)/Library/Caches/Firefox/", "\(home)/Library/Application Support/Mozilla/"],
+        reverseProtect: ["firefox"]
+    ),
+    Condition(
+        bundle_id: "org.mozilla.nightly",
+        include: ["firefoxnightly"],
+        exclude: ["thunderbird"],
+        includeForce: nil,
+        excludeForce: ["\(home)/Library/Application Support/Firefox/", "\(home)/Library/Caches/Firefox/", "\(home)/Library/Application Support/Mozilla/"],
+        reverseProtect: ["mozilla", "firefox"]
+    ),
+    Condition(
+        bundle_id: "org.mozilla.firefox.nightly",
+        include: ["firefoxnightly"],
+        exclude: ["thunderbird"],
+        includeForce: nil,
+        excludeForce: ["\(home)/Library/Application Support/Firefox/", "\(home)/Library/Caches/Firefox/", "\(home)/Library/Application Support/Mozilla/"],
+        reverseProtect: ["mozilla", "firefox"]
     ),
     Condition(
         bundle_id: "com.logi.optionsplus",
-        include: ["logi", "logipluginservice"],
+        include: ["logioptionsplus", "logipluginservice"],
         exclude: ["login", "logic"],
         includeForce: nil
     ),
@@ -135,9 +236,10 @@ var conditions: [Condition] = [
     ),
     Condition(
         bundle_id: "com.microsoft.VSCodeInsiders",
-        include: ["vscodeinsiders", "insiders"],
+        include: ["vscodeinsiders", "codeinsiders"],
         exclude: [],
-        includeForce: ["\(home)/Library/Application Support/Code - Insiders/"]
+        includeForce: ["\(home)/Library/Application Support/Code - Insiders/"],
+        reverseProtect: ["insiders"]
     ),
     Condition(
         bundle_id: "com.facebook.archon.developerid",
@@ -157,11 +259,16 @@ var conditions: [Condition] = [
         exclude: [],
         includeForce: nil
     ),
+    // These JetBrains folders hold every IDE's settings plus Toolbox data; only the product's own subfolder is selected
+    // (AppPathFinder.jetBrainsProductFolders), never the shared folders themselves
     Condition(
-        bundle_id: "jetbrains",
+        bundle_id: "com.jetbrains.",
         include: ["jcef"],
         exclude: [],
-        includeForce: ["\(home)/Library/Application Support/JetBrains/", "\(home)/Library/Caches/JetBrains/", "\(home)/Library/Logs/JetBrains/"]
+        includeForce: nil,
+        excludeForce: ["\(home)/Library/Application Support/JetBrains/", "\(home)/Library/Caches/JetBrains/", "\(home)/Library/Logs/JetBrains/"],
+        matchPrefix: true,
+        reverseProtect: ["jetbrains"]
     ),
     Condition(
         bundle_id: "company.thebrowser.Browser",
@@ -169,11 +276,13 @@ var conditions: [Condition] = [
         exclude: [],
         includeForce: ["\(home)/Library/Application Support/Arc/", "\(home)/Library/Caches/Arc/"]
     ),
+    // Only 1Password's native messaging host manifests in these browsers, not the browsers' whole data folders
     Condition(
         bundle_id: "com.1password.1password",
-        include: ["waveboxapp", "sidekick"],
+        include: [],
         exclude: [],
-        includeForce: nil
+        includeForce: ["\(home)/Library/Application Support/WaveboxApp/NativeMessagingHosts/com.1password.1password.json", "\(home)/Library/Application Support/Sidekick/NativeMessagingHosts/com.1password.1password.json"],
+        reverseProtect: ["waveboxapp", "sidekick"]
     ),
     Condition(
         bundle_id: "com.now.gg.BlueStacks",
@@ -187,11 +296,13 @@ var conditions: [Condition] = [
         exclude: [],
         includeForce: nil
     ),
+    // com.github.Electron.* is shared by every Electron app without its own bundle ID, so it is only protected from the orphan scan
     Condition(
         bundle_id: "com.github.githubclient",
-        include: ["comgithubelectron"],
+        include: [],
         exclude: [],
-        includeForce: nil
+        includeForce: nil,
+        reverseProtect: ["comgithubelectron"]
     ),
     Condition(
         bundle_id: "com.native-instruments.nativeaccess",

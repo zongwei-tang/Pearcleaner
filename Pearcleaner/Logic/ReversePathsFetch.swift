@@ -46,6 +46,13 @@ class ReversePathsSearcher {
         }
     }()
 
+    // Conditions that apply to an installed app, with the same exact/family matching as the app file search
+    private lazy var installedAppConditions: [Condition] = {
+        conditions.filter { condition in
+            sortedApps.contains { condition.applies(to: $0.bundleIdentifier) }
+        }
+    }()
+
     init(appState: AppState? = nil, locations: Locations, fsm: FolderSettingsManager, sortedApps: [AppInfo], streamingMode: Bool = true) {
         self.appState = appState
         self.locations = locations
@@ -256,14 +263,10 @@ class ReversePathsSearcher {
 
     private func isExcludedByConditions(normalizedItemPath: String) -> Bool {
 
-        for condition in conditions {
-            // Ensure the condition's bundle_id matches an installed app (condition.bundle_id is already formatted in Conditions.swift)
-            guard cachedAppIdentifiers.contains(where: { $0.formattedBundleId == condition.bundle_id || $0.formattedBundleId.contains(condition.bundle_id) }) else {
-                continue
-            }
-
-            // Include keywords (condition.include is already formatted in Conditions.swift)
-            if condition.include.contains(where: { normalizedItemPath.contains($0) }) {
+        for condition in installedAppConditions {
+            // Include keywords plus orphan-only protect keywords such as shared vendor folders (already formatted in Conditions.swift)
+            if condition.include.contains(where: { normalizedItemPath.contains($0) }) ||
+                condition.reverseProtect.contains(where: { normalizedItemPath.contains($0) }) {
                 return true
             }
 

@@ -54,6 +54,21 @@ class AppPathFinder {
     // Change from lazy var to regular property initialized in init
     private let cachedIdentifiers: (formattedBundleId: String, bundleLastTwoComponents: String, formattedAppName: String, formattedAppNameStripped: String?, appNameLettersOnly: String, pathComponentName: String, useBundleIdentifier: Bool, formattedCompanyName: String?, formattedEntitlements: [String], formattedTeamIdentifier: String?, formattedBaseBundleId: String?)
 
+    // Rules from Conditions.swift that apply to this app (exact bundle ID, or a family-wide rule)
+    private let matchedConditions: [Condition]
+    // The vendor ships several products (family-wide rule or shared vendor folders): skip company and team ID matches
+    private let sharedVendor: Bool
+    // Formatted bundle IDs of installed apps that extend this one (com.google.Chrome.beta for com.google.Chrome)
+    private let siblingBundleIds: [String]
+    // The app bundle being removed, plus a wrapped iOS app's container
+    private let mainBundlePaths: Set<String>
+    // Folders that hold installed apps; snapshot because folderPaths is @Published and matching runs on background queues
+    private let appFolderPaths: [String]
+    // App-data locations, the only places where app-group, binary-name and condition include tokens may match
+    private let appDataPrefixes: [String]
+    // User document folders: items inside them are listed but never preselected
+    private let userContentRoots: [String]
+
     // Exclusion list for app file search (computed property to always get current list)
     private var formattedAppExclusionList: [String] {
         return FolderSettingsManager.shared.fileFolderPathsApps.map { $0.pearFormat() }
@@ -129,6 +144,45 @@ class AppPathFinder {
         }()
 
         self.cachedIdentifiers = (formattedBundleId, bundleLastTwoComponents, formattedAppName, formattedAppNameStripped, appNameLettersOnly, pathComponentName, useBundleIdentifier, formattedCompanyName, formattedEntitlements, formattedTeamIdentifier, formattedBaseBundleId)
+
+        let matchedConditions = useBundleIdentifier ? conditions.filter { $0.applies(to: appInfo.bundleIdentifier) } : []
+        self.matchedConditions = matchedConditions
+        self.sharedVendor = matchedConditions.contains { $0.matchPrefix || $0.excludeForce != nil }
+
+        // Items named after another installed channel of this app belong to that channel (GUI only, the CLI has no app list)
+        self.siblingBundleIds = useBundleIdentifier ? (appState?.sortedApps ?? []).compactMap { app in
+            let id = app.bundleIdentifier.pearFormat()
+            return id.count > formattedBundleId.count && id.contains(formattedBundleId) ? id : nil
+        } : []
+
+        let appPath = appInfo.path.standardizedFileURL
+        var bundlePaths: Set<String> = [appPath.path]
+        if appPath.path.contains("Wrapper") {
+            bundlePaths.insert(appPath.deletingLastPathComponent().deletingLastPathComponent().path)
+        }
+        self.mainBundlePaths = bundlePaths
+
+        self.appFolderPaths = (["/Applications", "\(home)/Applications"] + FolderSettingsManager.shared.folderPaths)
+            .map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+
+        // Darwin cache/temp dirs come as /var/folders/...; accept the /private/var spelling too
+        let darwinDirs = [locations.cacheDir, locations.tempDir].filter { !$0.isEmpty }.flatMap { dir -> [String] in
+            let path = URL(fileURLWithPath: dir).standardizedFileURL.path
+            return [path, path.hasPrefix("/private/") ? String(path.dropFirst("/private".count)) : "/private" + path]
+        }
+        self.appDataPrefixes = (["\(home)/Library", "\(home)/Applications", "\(home)/.config", "/Library", "/Applications",
+                                 "/Users/Shared/Library", "/Users/Library", "/private/var/db/receipts", "/private/tmp", "/usr/local"] + darwinDirs)
+            .map { $0 + "/" }
+
+        let fileManager = FileManager.default
+        let userDirectories: [FileManager.SearchPathDirectory] = [.documentDirectory, .desktopDirectory, .downloadsDirectory, .picturesDirectory, .moviesDirectory, .musicDirectory, .sharedPublicDirectory]
+        var contentRoots = userDirectories.compactMap { fileManager.urls(for: $0, in: .userDomainMask).first?.standardizedFileURL.path }
+        if let userLibrary = fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first {
+            // iCloud Drive and File Provider folders (Dropbox, OneDrive, ...) hold the user's synced documents
+            contentRoots.append(userLibrary.appendingPathComponent("Mobile Documents").standardizedFileURL.path)
+            contentRoots.append(userLibrary.appendingPathComponent("CloudStorage").standardizedFileURL.path)
+        }
+        self.userContentRoots = contentRoots
     }
 
     // Process the initial URL
@@ -215,9 +269,11 @@ class AppPathFinder {
                             let parentURL = scannedItemURL.deletingLastPathComponent()
                             let parentName = parentURL.lastPathComponent
 
-                            // Add parent directory if it's NOT a standard macOS directory
-                            // This captures vendor folders like /Library/Objective-See/ instead of /Library/Objective-See/LuLu/
-                            if !Locations.standardLibrarySubdirectories.contains(parentName) {
+                            // Add parent directory if it's NOT a standard macOS directory and holds nothing but this match
+                            // This captures vendor folders like /Library/Objective-See/ instead of /Library/Objective-See/LuLu/,
+                            // but keeps vendor folders that also hold other products (Google, BraveSoftware, JetBrains, Microsoft)
+                            let parentContents = (try? FileManager.default.contentsOfDirectory(atPath: parentURL.path))?.filter { !$0.hasPrefix(".") } ?? []
+                            if !Locations.standardLibrarySubdirectories.contains(parentName) && parentContents == [scannedItem] {
                                 itemToAdd = parentURL
                             } else {
                                 itemToAdd = scannedItemURL
@@ -231,7 +287,8 @@ class AppPathFinder {
 
                     // If this is a directory and we haven't reached max depth, mark for recursive search
                     // Skip directories in the exclusion list when doing Library root deep searches
-                    if isDirectory.boolValue && currentDepth < maxDepth {
+                    // Never descend into app bundles: their contents (an iPad app's Wrapper, #557) belong to that app
+                    if isDirectory.boolValue && currentDepth < maxDepth && scannedItemURL.pathExtension.lowercased() != "app" {
                         // For Library root searches at depth 0, check if directory should be excluded from deep search
                         if isLibraryRootSearch && currentDepth == 0 {
                             let dirName = scannedItemURL.lastPathComponent
@@ -354,24 +411,48 @@ class AppPathFinder {
             }
         }
 
+        // Another app bundle in an app folder is never a leftover of this app (stable Chrome when removing Chrome Dev, #607)
+        if isForeignAppBundle(scannedItemURL) {
+            return false
+        }
+
+        // Items named after another installed channel of this app belong to that channel
+        if siblingBundleIds.contains(where: { normalizedItemName.contains($0) }) {
+            return false
+        }
+
+        // Condition excludes apply in every location and win over every match below
+        for condition in matchedConditions where condition.exclude.contains(where: { normalizedItemName.contains($0) }) {
+            return false
+        }
+
+        // App-group/binary-name tokens and condition include tokens only match in app-data locations,
+        // never in Documents, the desktop folder or the home folder itself (#557, #571)
+        let isTokenLocation = isAppDataLocation(scannedItemURL)
+
         // Check entitlements-based matching (using pre-formatted entitlements)
         // Strict: exact match only, Enhanced/Deep: contains match
-        for entitlementFormatted in cached.formattedEntitlements {
-            let isMatch = effectiveSensitivityLevel == .strict
-                ? normalizedItemName == entitlementFormatted
-                : normalizedItemName.contains(entitlementFormatted)
+        if isTokenLocation {
+            for entitlementFormatted in cached.formattedEntitlements {
+                let isMatch = effectiveSensitivityLevel == .strict
+                    ? normalizedItemName == entitlementFormatted
+                    : normalizedItemName.contains(entitlementFormatted)
 
-            if isMatch {
-                return true
+                if isMatch {
+                    return true
+                }
             }
         }
 
-        for condition in conditions {
-            if cached.useBundleIdentifier && cached.formattedBundleId.contains(condition.bundle_id) {
-                if condition.exclude.contains(where: { normalizedItemName.contains($0) }) {
-                    return false
-                }
-                if condition.include.contains(where: { normalizedItemName.contains($0) }) {
+        // Condition include tokens follow the sensitivity level too
+        // Strict: exact match only, Enhanced/Deep: contains match
+        if isTokenLocation {
+            for condition in matchedConditions {
+                let isMatch = effectiveSensitivityLevel == .strict
+                    ? condition.include.contains(normalizedItemName)
+                    : condition.include.contains(where: { normalizedItemName.contains($0) })
+
+                if isMatch {
                     return true
                 }
             }
@@ -396,17 +477,17 @@ class AppPathFinder {
             twoComponentMatch = false
         }
 
-        // Company name matching (Deep level only)
+        // Company name matching (Deep level only, not for vendors that ship several products)
         let companyMatch: Bool
-        if effectiveSensitivityLevel == .deep, let company = cached.formattedCompanyName, !company.isEmpty {
+        if effectiveSensitivityLevel == .deep, !sharedVendor, let company = cached.formattedCompanyName, !company.isEmpty {
             companyMatch = normalizedItemName.contains(company)
         } else {
             companyMatch = false
         }
 
-        // Team identifier matching (Deep level only)
+        // Team identifier matching (Deep level only, not for vendors that ship several products)
         let teamIdMatch: Bool
-        if effectiveSensitivityLevel == .deep, let teamId = cached.formattedTeamIdentifier, !teamId.isEmpty {
+        if effectiveSensitivityLevel == .deep, !sharedVendor, let teamId = cached.formattedTeamIdentifier, !teamId.isEmpty {
             teamIdMatch = normalizedItemName.contains(teamId)
         } else {
             teamIdMatch = false
@@ -432,7 +513,82 @@ class AppPathFinder {
 
         return (cached.useBundleIdentifier && fullBundleMatch) || (appNameMatch || pathNameMatch || appNameLettersMatch) || twoComponentMatch || companyMatch || teamIdMatch || baseBundleIdMatch || strippedAppNameMatch
     }
-    
+
+    // An .app bundle inside an app folder that is not the app being removed (Xcode-beta shares Xcode's bundle ID, so compare paths)
+    private func isForeignAppBundle(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "app" else { return false }
+        let path = url.standardizedFileURL.path
+        if mainBundlePaths.contains(path) { return false }
+        return appFolderPaths.contains { path.hasPrefix($0 + "/") }
+    }
+
+    // Library folders, app folders, receipts, temp/cache dirs and hidden app folders in home such as ~/.vscode
+    private func isAppDataLocation(_ url: URL) -> Bool {
+        let path = url.path
+        return appDataPrefixes.contains { path.hasPrefix($0) } || path.hasPrefix(home + "/.")
+    }
+
+    // Documents, the desktop folder, Downloads, Pictures, Movies, Music, Public, iCloud Drive, cloud storage, or directly in home
+    private func isUserContent(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        if (path as NSString).deletingLastPathComponent == home { return true }
+        return userContentRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    // The app itself is preselected wherever it lives, as is a Steam game's desktop shortcut
+    private func isAppBundle(_ url: URL) -> Bool {
+        if mainBundlePaths.contains(url.standardizedFileURL.path) { return true }
+        return appInfo.steam && url.pathExtension == "app"
+    }
+
+    // Spotlight path predicates match anywhere in the path ("kMDItemPath CONTAINS com.google.Chrome" also matches
+    // com.google.Chrome.beta), so apply the sibling and condition excludes to every path component below home
+    private func isExcludedSpotlightPath(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let relativePath = path.hasPrefix(home + "/") ? String(path.dropFirst(home.count + 1)) : path
+        for component in relativePath.split(separator: "/") {
+            let name = String(component).pearFormat()
+            if siblingBundleIds.contains(where: { name.contains($0) }) {
+                return true
+            }
+            if matchedConditions.contains(where: { condition in condition.exclude.contains(where: { name.contains($0) }) }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // JetBrains IDEs share the JetBrains folders in Application Support, Caches and Logs. Select only this product's
+    // subfolder, named by "dataDirectoryName" in product-info.json (e.g. "PyCharm2025.2"), or Toolbox's own folder.
+    // Older versions' folders (e.g. "PyCharm2025.1") are left alone: they may belong to another installed copy
+    private func jetBrainsProductFolders() -> [URL] {
+        let bundleId = appInfo.bundleIdentifier.lowercased()
+        guard bundleId.hasPrefix("com.jetbrains.") else { return [] }
+        let isToolbox = bundleId == "com.jetbrains.toolbox"
+        let folderName: String
+        if isToolbox {
+            folderName = "Toolbox"
+        } else {
+            let productInfo = appInfo.path.appendingPathComponent("Contents/Resources/product-info.json")
+            guard let data = try? Data(contentsOf: productInfo),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataDirectoryName = json["dataDirectoryName"] as? String,
+                  !dataDirectoryName.isEmpty, !dataDirectoryName.contains("/"), !dataDirectoryName.hasPrefix(".") else {
+                return []
+            }
+            folderName = dataDirectoryName
+        }
+        return ["Application Support", "Caches", "Logs"].compactMap { root in
+            let folder = URL(fileURLWithPath: "\(home)/Library/\(root)/JetBrains").appendingPathComponent(folderName)
+            guard FileManager.default.fileExists(atPath: folder.path) else { return nil }
+            // Older Toolbox versions installed the IDEs themselves under Toolbox/apps
+            if isToolbox && FileManager.default.fileExists(atPath: folder.appendingPathComponent("apps").path) {
+                return nil
+            }
+            return folder
+        }
+    }
+
     // Helper function to extract game ID from manifest filename
     private func extractGameId(from filename: String) -> String? {
         // Extract from "appmanifest_1289310.acf" -> "1289310"
@@ -578,7 +734,8 @@ class AppPathFinder {
             query.predicate = NSCompoundPredicate(orPredicateWithSubpredicates: subpredicates)
         }
 
-        query.searchScopes = [NSMetadataQueryUserHomeScope]
+        // Only the user's Library: a home-wide scope pulls in documents, e.g. every Pages file for Pages (#571)
+        query.searchScopes = [URL(fileURLWithPath: "\(home)/Library", isDirectory: true)]
 
         let currentRunLoop = CFRunLoopGetCurrent()
 
@@ -599,6 +756,11 @@ class AppPathFinder {
                     let pathFormatted = url.lastPathComponent.pearFormat()
                     return pathFormatted == nameFormatted || pathFormatted == bundleFormatted
                 }
+            }
+
+            // All levels: no user documents (iCloud Drive, cloud storage), no other channel's or excluded paths
+            results = results.filter { url in
+                !self.isUserContent(url) && !self.isExcludedSpotlightPath(url)
             }
 
             CFRunLoopStop(currentRunLoop)
@@ -637,7 +799,6 @@ class AppPathFinder {
             }
 
             tempCollection.append(contentsOf: self.containerCollection)
-            tempCollection.append(contentsOf: outliers)
 
             // Insert spotlight results before sorting and filtering
             Task { @MainActor in
@@ -654,10 +815,13 @@ class AppPathFinder {
 
             tempCollection.append(contentsOf: spotlightOnly)
 
+            // excludeForce drops a shared vendor folder and everything below it; includeForce paths are added after
+            // that, so a product's own folder inside the vendor folder is kept
             let excludePaths = outliersEx.map { $0.path }
             tempCollection.removeAll { url in
-                excludePaths.contains(url.path)
+                excludePaths.contains { url.path == $0 || url.path.hasPrefix($0 + "/") }
             }
+            tempCollection.append(contentsOf: outliers)
 
             // Apply app exclusion filter to ALL discovered files (from all code paths)
             tempCollection.removeAll { fileURL in
@@ -695,17 +859,18 @@ class AppPathFinder {
             tempCollection = Array(self.collectionSet)
         }
         tempCollection.append(contentsOf: self.containerCollection)
-        tempCollection.append(contentsOf: outliers)
         // Insert spotlight results before sorting and filtering
         let spotlightResults = self.spotlightSupplementalPaths()
         let spotlightOnly = spotlightResults.filter { !self.collectionSet.contains($0) }
         //        printOS("Spotlight index found: \(spotlightOnly.count)")
         tempCollection.append(contentsOf: spotlightOnly)
 
+        // excludeForce drops a shared vendor folder and everything below it; includeForce paths are added after that
         let excludePaths = outliersEx.map { $0.path }
         tempCollection.removeAll { url in
-            excludePaths.contains(url.path)
+            excludePaths.contains { url.path == $0 || url.path.hasPrefix($0 + "/") }
         }
+        tempCollection.append(contentsOf: outliers)
 
         // Apply app exclusion filter to ALL discovered files (from all code paths)
         tempCollection.removeAll { fileURL in
@@ -724,6 +889,8 @@ class AppPathFinder {
             filteredCollection.append(url)
             previousUrl = url
         }
+        // The CLI cannot uncheck items, so user documents and items directly in home are left out entirely
+        filteredCollection.removeAll { isUserContent($0) && !isAppBundle($0) }
         if filteredCollection.count == 1, let firstURL = filteredCollection.first, firstURL.path.contains(".Trash") {
             filteredCollection.removeAll()
         }
@@ -733,14 +900,10 @@ class AppPathFinder {
     // Handle outlier paths based on conditions
     private func handleOutliers(include: Bool = true) -> [URL] {
         var outliers: [URL] = []
-        let bundleIdentifier = self.appInfo.bundleIdentifier.pearFormat()
-        let matchingConditions = conditions.filter { condition in
-            bundleIdentifier.contains(condition.bundle_id)
-        }
-        for condition in matchingConditions {
+        for condition in matchedConditions {
             if include {
                 if let forceIncludes = condition.includeForce {
-                    for path in forceIncludes {
+                    for path in forceIncludes where FileManager.default.fileExists(atPath: path.path) {
                         outliers.append(path)
                     }
                 }
@@ -751,6 +914,9 @@ class AppPathFinder {
                     }
                 }
             }
+        }
+        if include {
+            outliers.append(contentsOf: jetBrainsProductFolders())
         }
         return outliers
     }
@@ -805,7 +971,11 @@ class AppPathFinder {
             self.appInfo.arch = arch
             self.appState?.appInfo = self.appInfo
             if !self.undo {
-                self.appState?.selectedItems = Set(updatedCollection)
+                // User documents and items directly in home stay listed but unchecked (#587, #549); the app bundle
+                // and files the user associated by hand are still preselected
+                self.appState?.selectedItems = Set(updatedCollection.filter { url in
+                    !self.isUserContent(url) || self.isAppBundle(url) || associatedFiles.contains(url)
+                })
             }
             self.appState?.progressStep = 0
             self.appState?.showProgress = false
